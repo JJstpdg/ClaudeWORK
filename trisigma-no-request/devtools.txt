@@ -1,0 +1,172 @@
+# ==================================================================================================
+# Устройства, которые запустили приложение, но не отправили ни одного запроса в Trisigma.
+# Kibana -> Dev Tools -> Console. Вставляйте блоки по одному и запускайте (Ctrl+Enter).
+# Время везде UTC (МСК = UTC+3). Названия полей ниже - предположение; если ES|QL пишет
+# "Unknown column [...]" - подберите настоящие имена шагами 1-2 и замените их в запросах.
+# ==================================================================================================
+
+
+# ---- 0. Версия кластера. ES|QL (шаги 3-5) работает с Elasticsearch 8.14+ ------------------------
+GET /
+
+
+# ---- 1. Как выглядят логи Ingress: последний запрос к trisigma и последний вообще ---------------
+GET mpback-k8s-ingress*/_search
+{
+  "size": 1,
+  "sort": [{"@timestamp": {"order": "desc"}}],
+  "query": {"bool": {"filter": [
+    {"range": {"@timestamp": {"gte": "now-3d"}}},
+    {"query_string": {"query": "*trisigma*", "lenient": true, "analyze_wildcard": true}}
+  ]}}
+}
+
+GET mpback-k8s-ingress*/_search
+{
+  "size": 1,
+  "sort": [{"@timestamp": {"order": "desc"}}],
+  "query": {"range": {"@timestamp": {"gte": "now-3d"}}}
+}
+
+
+# ---- 2. Имена полей: устройство / пользователь / платформа / версия / путь / статус / сессия ----
+GET mpback-k8s-ingress*/_field_caps?fields=*device*,*visitor*,*user*,*session*&ignore_unavailable=true
+
+GET mpback-k8s-ingress*/_field_caps?fields=*platform*,*version*,*path*,*uri*,*url*,*status*&ignore_unavailable=true
+
+# и индекс trisigma-composition: последний документ (где лежит visitorId)
+GET mpback-k8s-trisigma-composition*/_search
+{
+  "size": 1,
+  "sort": [{"@timestamp": {"order": "desc"}}]
+}
+
+
+
+# ---- 3. Проверка фильтров (окно 1-2 часа). Должны быть: сервисы (не только пустой), пути trisigma,
+#         версии приложения. Если путей trisigma нет - основной запрос выдаст ВСЕХ, не запускайте его.
+# 3a. сервисы, разобранные из path
+POST /_query?format=txt
+{
+  "query": """
+    FROM mpback-k8s-ingress*
+    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z"
+    | WHERE TO_LOWER(platform) IN ("ios", "android")
+    | DISSECT path "/gateway/%{svc}/%{?rest}"
+    | RENAME device_id AS dev
+    | STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev) BY svc
+    | SORT docs DESC
+    | LIMIT 30
+  """
+}
+
+# 3b. запросы к trisigma в Ingress (реальные пути и сколько устройств)
+POST /_query?format=txt
+{
+  "query": """
+    FROM mpback-k8s-ingress*
+    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z"
+    | WHERE TO_LOWER(path) LIKE "*trisigma*"
+    | RENAME device_id AS dev
+    | STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev), first_ts = MIN(@timestamp), last_ts = MAX(@timestamp) BY path
+    | SORT docs DESC
+    | LIMIT 15
+  """
+}
+
+# 3c. версии приложения (порог основного запроса: строго больше 11.10.0)
+POST /_query?format=txt
+{
+  "query": """
+    FROM mpback-k8s-ingress*
+    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z"
+    | WHERE TO_LOWER(platform) IN ("ios", "android")
+    | GROK app_version "^%{INT:v_major:int}[.]%{INT:v_minor:int}[.]%{INT:v_patch:int}"
+    | RENAME device_id AS dev
+    | STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev) BY v_major, v_minor, v_patch
+    | SORT v_major DESC, v_minor DESC, v_patch DESC
+    | LIMIT 30
+  """
+}
+
+
+
+# ---- 4. ОСНОВНОЙ ЗАПРОС: кандидаты --------------------------------------------------------------
+# Запуск = устройство обратилось не менее чем в 7 разных сервисов за одну минуту (веер запросов при старте).
+# Кандидат = запуск в [from, to), а запросов к trisigma после него нет ни в этом окне, ни в 30 минутах после.
+# Порог версии: строго больше 11.10.0 (для «11.10.0 и выше» замените `> 11010000` на `>= 11010000`).
+# Окно начните с нескольких часов: запрос группирует по устройству и минуте, на суточном окне ему нужно много памяти.
+# Результат - предварительный: следующим шагом проверьте кандидатов на запросы ПОЗЖЕ и в индексе composition.
+POST /_query?format=txt
+{
+  "query": """
+    FROM mpback-k8s-ingress*
+    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z" AND device_id IS NOT NULL
+    | GROK app_version "^%{INT:v_major:int}[.]%{INT:v_minor:int}[.]%{INT:v_patch:int}"
+    | EVAL is_tri = TO_LOWER(path) LIKE "*trisigma*", ver_num = v_major * 1000000 + v_minor * 1000 + v_patch
+    | EVAL ok = NOT is_tri AND TO_LOWER(platform) IN ("ios", "android") AND ver_num > 11010000
+    | DISSECT path "/gateway/%{svc}/%{?rest}"
+    | EVAL svc_ok = CASE(ok, svc), ver_ok = CASE(ok, ver_num), plat_ok = CASE(ok, CASE(TO_LOWER(platform) == "ios", 4, 5)), tri_flag = CASE(is_tri, 1, 0)
+    | EVAL minute = DATE_TRUNC(1 minute, @timestamp)
+    | RENAME device_id AS dev
+    | STATS svc_cnt = COUNT_DISTINCT(svc_ok), tri_cnt = SUM(tri_flag), ver_num = MAX(ver_ok), plat = MAX(plat_ok), last_seen = MAX(@timestamp), uid = MAX(user_id) BY dev, minute
+    | EVAL is_launch = svc_cnt >= 7 AND minute < "2026-09-29T06:00:00Z"
+    | EVAL launch_flag = CASE(is_launch, 1, 0), launch_min = CASE(is_launch, minute), fan = CASE(is_launch, svc_cnt), tri_min = CASE(tri_cnt > 0, minute)
+    | STATS launches = SUM(launch_flag), first_launch = MIN(launch_min), max_fanout = MAX(fan), tri_total = SUM(tri_cnt), last_tri = MAX(tri_min), ver_num = MAX(ver_num), plat = MAX(plat), last_seen = MAX(last_seen), uid = MAX(uid) BY dev
+    | WHERE launches > 0 AND (tri_total == 0 OR last_tri < first_launch - 2 minutes)
+    | EVAL platform = CASE(plat == 4, "ios", "android"), app_version = CONCAT(TO_STRING(ver_num / 1000000), ".", TO_STRING((ver_num / 1000) % 1000), ".", TO_STRING(ver_num % 1000))
+    | KEEP uid, dev, platform, app_version, first_launch, launches, max_fanout, last_seen, tri_total
+    | SORT first_launch
+    | LIMIT 10000
+  """
+}
+
+
+
+# ---- 5. Проверка кандидатов: у кого из них запрос в trisigma всё-таки был (это «ошибочные») -----
+# Подставьте device_id из шага 4 (до нескольких сотен за раз) и время начала окна.
+# 5a. Ingress: запросы к trisigma БЕЗ верхней границы по времени. Кто вернулся в ответе - тот не наш.
+POST mpback-k8s-ingress*/_search
+{
+  "size": 0,
+  "query": {"bool": {"filter": [
+    {"terms": {"device_id": ["<device_id_1>", "<device_id_2>"]}},
+    {"range": {"@timestamp": {"gte": "2026-09-29T00:00:00Z"}}},
+    {"wildcard": {"path": {"value": "*trisigma*", "case_insensitive": true}}}
+  ]}},
+  "aggs": {"by_device": {
+    "terms": {"field": "device_id", "size": 1000},
+    "aggs": {"first_request": {"min": {"field": "@timestamp"}}}
+  }}
+}
+
+# 5b. trisigma-composition: id устройства ищется фразой по всем полям (visitorId обычно внутри тела запроса).
+# Кто встретился в ответе (смотрите _source) - тот получил запрос в trisigma.
+# Если Elasticsearch ругается на число полей - добавьте в query_string "fields": ["message"] (или своё поле с телом запроса).
+POST mpback-k8s-trisigma-composition*/_search
+{
+  "size": 200,
+  "_source": ["@timestamp", "message"],
+  "query": {"bool": {"filter": [
+    {"range": {"@timestamp": {"gte": "2026-09-29T00:00:00Z"}}},
+    {"query_string": {"query": "\"<device_id_1>\" OR \"<device_id_2>\"", "lenient": true}}
+  ]}}
+}
+
+
+# ---- 6. (по желанию) Пересечение с событиями без эксперимента -----------------------------------
+# Замените индекс, поле устройства и поле эксперимента на свои. «Не пришло или пустое» = нет поля / null / "".
+# В IN подставьте device_id кандидатов, прошедших шаг 5. Останутся те, у кого ни в одном событии эксперимента нет.
+POST /_query?format=txt
+{
+  "query": """
+    FROM <индекс-событий>*
+    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z"
+    | WHERE device_id IN ("<device_id_1>", "<device_id_2>")
+    | EVAL has_experiment = experiment IS NOT NULL AND experiment != ""
+    | EVAL exp_flag = CASE(has_experiment, 1, 0)
+    | STATS events = COUNT(*), events_with_experiment = SUM(exp_flag) BY device_id
+    | WHERE events_with_experiment == 0
+    | LIMIT 10000
+  """
+}
