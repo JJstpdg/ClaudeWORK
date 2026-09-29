@@ -28,6 +28,10 @@ echo "== версия >= 11.10.0"
 python3 $S --es-url "$ES_URL" run "${W[@]}" --out "$OUT/incl" --set inclusive=true > /dev/null
 python3 check.py "$OUT/expected.json" "$OUT/incl" inclusive
 
+echo "== упавшие запросы (401/5xx) не считаются запросом (tri_ok_only=true)"
+python3 $S --es-url "$ES_URL" run "${W[@]}" --out "$OUT/okonly" --set tri_ok_only=true > /dev/null
+python3 check.py "$OUT/expected.json" "$OUT/okonly" ok_only
+
 echo "== окно кусками по 1.5 часа"
 python3 $S --es-url "$ES_URL" run "${W[@]}" --out "$OUT/sliced" --slice-hours 1.5 > /dev/null
 python3 check.py "$OUT/expected.json" "$OUT/sliced" strict

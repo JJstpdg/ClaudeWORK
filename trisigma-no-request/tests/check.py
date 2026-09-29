@@ -1,6 +1,6 @@
 """Compare the CSVs written by find_no_trisigma.py with the oracle written by gen_synthetic.py.
 
-usage: check.py <expected.json> <output-prefix> [strict|inclusive|gap60|audit]
+usage: check.py <expected.json> <output-prefix> [strict|inclusive|gap60|ok_only|audit]
 """
 import csv
 import json
@@ -20,7 +20,7 @@ def want(key):
     out = set()
     for dev, v in exp.items():
         x = v[key]
-        if x is True or (x == "edge" and mode == "inclusive"):
+        if x is True or (x == "edge" and mode == "inclusive") or (mode == "ok_only" and v["scenario"] in ("failed_tri", "tri_401")):
             out.add(dev)
     return out
 

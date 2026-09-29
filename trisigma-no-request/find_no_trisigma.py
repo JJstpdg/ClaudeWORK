@@ -43,26 +43,29 @@ import urllib.request
 # Настройки. Названия полей - предположение: проверьте командой `discover` и поправьте под свои логи.
 # --------------------------------------------------------------------------------------------------
 CFG = {
-    # индексы (шаблоны: индексы обычно дневные, *-YYYY.MM.DD)
-    "ingress_index": "mpback-k8s-ingress*",
-    "comp_index": "mpback-k8s-trisigma-composition*",
+    # индексы (шаблоны: индексы дневные, *-YYYYMMDD)
+    "ingress_index": "mpback-k8s-ingress-*",
+    "comp_index": "mpback-k8s-trisigma-composition-*",
     "events_index": "",                       # необязательно: индекс событий с полем эксперимента
 
-    # поля Ingress
+    # поля Ingress (значения по умолчанию сняты с реальных документов mpback-k8s-ingress)
     "ts": "@timestamp",
-    "device": "device_id",                    # visitorId в Trisigma == user-agent.id == device_uuid на бэке
-    "device_term": "",                        # если по device нужен другой (keyword) вариант, напр. device_id.keyword
-    "user": "user_id",                        # пусто -> user_id в выгрузке не нужен
-    "platform": "platform",                   # значения ios / android (регистр не важен)
-    "version": "app_version",                 # 11.10.1_380 (iOS), 11.10.1.g_20300 (Android)
-    "path": "path",                           # URI запроса, по нему определяем сервис и запросы в trisigma
-    "status": "status",                       # HTTP-статус, только для диагностики
+    "host": "log.request_hostname",           # фильтр по хосту API мобильного приложения; пусто в host_value = без фильтра
+    "host_value": "orderapp.burgerkingrus.ru",
+    "device": "log.http_user_agent",          # JSON {"id":"<visitorId>",...}: id устройства лежит внутри него
+    "device_grok": r'\"id\"%{SPACE}:%{SPACE}\"%{DATA:dev}\"',  # как достать id; пусто = поле device уже само является id
+    "user": "log.http_x_burgerking_user_id",  # пусто -> user_id в выгрузке не нужен (у неавторизованных он пустой)
+    "platform": "log.http_x_burgerking_platform",   # ios / android (регистр не важен)
+    "version": "log.http_x_burgerking_version",     # 11.11.0_384 (iOS), 11.11.0-rc-08.g_20269 (Android)
+    "path": "log.request_url",                # /gateway/<сервис>/api/v7/...
+    "status": "log.status",                   # HTTP-статус ("200", "401", ...)
     "svc_dissect": "/gateway/%{svc}/%{?rest}",  # как из path вытащить имя сервиса (для веера запросов)
     "tri_like": "*trisigma*",                 # признак запроса в trisigma в path (регистр не важен)
+    "tri_ok_only": "false",                   # false: любой запрос к trisigma (в т.ч. 401/5xx) = «запрос был»; true: только статус < 400
 
-    # индекс trisigma-composition
+    # индекс trisigma-composition: где искать id устройства (через запятую; в теле запроса к Trisigma и в User-Agent)
     "comp_ts": "@timestamp",
-    "comp_device": "",                        # поле с visitorId; пусто -> искать id фразой по всем полям
+    "comp_device": "log.http_incoming_request.request_data.user_agent,log.outgoing_http_request.request_data.body",
 
     # индекс событий (для пересечения)
     "ev_ts": "@timestamp",
@@ -71,7 +74,7 @@ CFG = {
     "ev_experiment": "experiment",            # «не пришло или пустое» = поля нет / null / "" / []
 
     # логика
-    "fanout_min": "7",                        # запуск = не менее N разных сервисов за одну минуту (в старой выгрузке 7-9)
+    "fanout_min": "6",                        # запуск = не менее N разных сервисов шлюза за одну минуту (на реальных логах веер при старте 6-10)
     "pre_margin_min": "2",                    # запрос в trisigma чуть ДО первой минуты веера считаем частью запуска
     "buffer_min": "30",                       # сколько минут после конца окна ещё ищем запросы в trisigma
     "min_gap_min": "0",                       # >0: брать только «холодные» запуски - пауза перед ними не меньше N минут
@@ -82,14 +85,16 @@ CFG = {
 }
 
 MAIN_ESQL = r'''FROM <<ingress_index>>
-| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>" AND <<device>> IS NOT NULL
+| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>"<<host_filter>>
 | GROK <<version>> "^%{INT:v_major:int}[.]%{INT:v_minor:int}[.]%{INT:v_patch:int}"
-| EVAL is_tri = TO_LOWER(<<path>>) LIKE "<<tri_like>>", ver_num = v_major * 1000000 + v_minor * 1000 + v_patch
-| EVAL ok = NOT is_tri AND TO_LOWER(<<platform>>) IN ("ios", "android") AND ver_num <<op>> <<threshold>>
+| EVAL ver_num = v_major * 1000000 + v_minor * 1000 + v_patch, is_tri_path = TO_LOWER(<<path>>) LIKE "<<tri_like>>"<<status_eval>>
+| WHERE ver_num <<op>> <<threshold>> OR is_tri_path
+<<dev_extract>>
+| WHERE dev IS NOT NULL
+| EVAL is_tri = <<is_tri_expr>>, ok = NOT is_tri_path AND TO_LOWER(<<platform>>) IN ("ios", "android") AND ver_num <<op>> <<threshold>><<user_eval>>
 | DISSECT <<path>> "<<svc_dissect>>"
 | EVAL svc_ok = CASE(ok, svc), ver_ok = CASE(ok, ver_num), plat_ok = CASE(ok, CASE(TO_LOWER(<<platform>>) == "ios", 4, 5)), tri_flag = CASE(is_tri, 1, 0)
 | EVAL minute = DATE_TRUNC(1 minute, <<ts>>)
-| RENAME <<device>> AS dev
 | STATS svc_cnt = COUNT_DISTINCT(svc_ok), tri_cnt = SUM(tri_flag), ver_num = MAX(ver_ok), plat = MAX(plat_ok), last_seen = MAX(<<ts>>)<<user_agg1>> BY dev, minute
 | EVAL is_launch = svc_cnt >= <<fanout_min>> AND minute < "<<t_to>>"
 | EVAL launch_flag = CASE(is_launch, 1, 0), launch_min = CASE(is_launch, minute), fan = CASE(is_launch, svc_cnt), tri_min = CASE(tri_cnt > 0, minute)
@@ -101,33 +106,34 @@ MAIN_ESQL = r'''FROM <<ingress_index>>
 | LIMIT <<esql_limit>>'''
 
 GATE_TRI = r'''FROM <<ingress_index>>
-| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>"
+| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>"<<host_filter>>
 | WHERE TO_LOWER(<<path>>) LIKE "<<tri_like>>"
-| EVAL has_dev = <<device>> IS NOT NULL
+<<dev_extract>>
+| EVAL has_dev = dev IS NOT NULL
 | STATS docs = COUNT(*), with_device = SUM(CASE(has_dev, 1, 0))'''
 
 SANITY_SERVICES = r'''FROM <<ingress_index>>
-| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>"
+| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>"<<host_filter>>
 | WHERE TO_LOWER(<<platform>>) IN ("ios", "android")
 | DISSECT <<path>> "<<svc_dissect>>"
-| RENAME <<device>> AS dev
+<<dev_extract>>
 | STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev) BY svc
 | SORT docs DESC
 | LIMIT 30'''
 
 SANITY_TRI = r'''FROM <<ingress_index>>
-| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>"
+| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>"<<host_filter>>
 | WHERE TO_LOWER(<<path>>) LIKE "<<tri_like>>"
-| RENAME <<device>> AS dev
-| STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev), first_ts = MIN(<<ts>>), last_ts = MAX(<<ts>>) BY <<path>>
+<<dev_extract>>
+| STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev), first_ts = MIN(<<ts>>), last_ts = MAX(<<ts>>) BY <<path>>, <<status>>
 | SORT docs DESC
 | LIMIT 15'''
 
 SANITY_VERSIONS = r'''FROM <<ingress_index>>
-| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>"
+| WHERE <<ts>> >= "<<t_from>>" AND <<ts>> < "<<t_end>>"<<host_filter>>
 | WHERE TO_LOWER(<<platform>>) IN ("ios", "android")
 | GROK <<version>> "^%{INT:v_major:int}[.]%{INT:v_minor:int}[.]%{INT:v_patch:int}"
-| RENAME <<device>> AS dev
+<<dev_extract>>
 | STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev) BY v_major, v_minor, v_patch
 | SORT v_major DESC, v_minor DESC, v_patch DESC
 | LIMIT 30'''
@@ -222,16 +228,30 @@ def esql_params(cfg, t_from, t_to, t_end):
     if not thr:
         die("min_version должен быть вида 11.10.0")
     user = cfg["user"].strip()
+    host, host_value = cfg["host"].strip(), cfg["host_value"].strip()
+    grok = cfg["device_grok"].strip()
+    dev = qid(cfg["device"])
+    esc = lambda x: x.replace('"', '\\"')
+    if grok:
+        dev_extract = '| GROK %s "%s"' % (dev, grok)
+    else:
+        dev_extract = "| RENAME %s AS dev" % dev
+    ok_only = as_bool(cfg["tri_ok_only"])
     p = dict(
-        ingress_index=cfg["ingress_index"], ts=qid(cfg["ts"]), device=qid(cfg["device"]),
+        ingress_index=cfg["ingress_index"], ts=qid(cfg["ts"]), status=qid(cfg["status"]),
         platform=qid(cfg["platform"]), version=qid(cfg["version"]), path=qid(cfg["path"]),
-        svc_dissect=cfg["svc_dissect"].replace('"', '\\"'),
-        tri_like=cfg["tri_like"].lower().replace('"', '\\"'),
+        host_filter=(' AND %s == "%s"' % (qid(host), esc(host_value))) if host and host_value else "",
+        dev_extract=dev_extract,
+        svc_dissect=esc(cfg["svc_dissect"]),
+        tri_like=esc(cfg["tri_like"].lower()),
         t_from=iso(t_from), t_to=iso(t_to), t_end=iso(t_end),
         op=">=" if as_bool(cfg["inclusive"]) else ">", threshold=ver_num(thr),
         fanout_min=int(cfg["fanout_min"]), pre_margin_min=int(cfg["pre_margin_min"]),
         esql_limit=int(cfg["esql_limit"]),
-        user_agg1=(", uid = MAX(%s)" % qid(user)) if user else "",
+        status_eval=(", st = TO_INTEGER(%s)" % qid(cfg["status"])) if ok_only else "",
+        is_tri_expr="is_tri_path AND st < 400" if ok_only else "is_tri_path",
+        user_eval=(", uid_n = TO_LONG(%s)" % qid(user)) if user else "",
+        user_agg1=", uid = MAX(uid_n)" if user else "",
         user_agg2=", uid = MAX(uid)" if user else "",
         keep_user="uid, " if user else "",
     )
@@ -418,29 +438,38 @@ def level1(cli, cfg, t_from, t_to, slice_hours, use_async):
 # --------------------------------------------------------------------------------------------------
 # Уровень 2: для каждого кандидата ищем запрос в trisigma БЕЗ верхней границы по времени
 # --------------------------------------------------------------------------------------------------
+def dev_match(fields, dev):
+    """Устройство ищем и как точное значение поля (keyword), и как фразу (text: id лежит внутри JSON/тела запроса)."""
+    should = []
+    for f in [x.strip() for x in fields.split(",") if x.strip()]:
+        should.append({"term": {f: {"value": dev, "case_insensitive": True}}})
+        should.append({"match_phrase": {f: dev}})
+    return {"bool": {"should": should, "minimum_should_match": 1}}
+
+
 def ingress_probe(cfg, dev, since):
     ts, path = cfg["ts"], cfg["path"]
-    dev_field = cfg["device_term"] or cfg["device"]
+    flt = [
+        dev_match(cfg["device"], dev),
+        {"range": {ts: {"gte": iso(since)}}},
+        {"wildcard": {path: {"value": cfg["tri_like"].lower(), "case_insensitive": True}}},
+    ]
+    must_not = []
+    if as_bool(cfg["tri_ok_only"]):
+        must_not.append({"regexp": {cfg["status"]: "[45][0-9][0-9]"}})
     return {
         "size": 1, "track_total_hits": False,
         "_source": [ts, path, cfg["status"]],
         "sort": [{ts: {"order": "asc", "unmapped_type": "date"}}],
-        "query": {"bool": {"filter": [
-            {"term": {dev_field: {"value": dev}}},
-            {"range": {ts: {"gte": iso(since)}}},
-            {"wildcard": {path: {"value": cfg["tri_like"].lower(), "case_insensitive": True}}},
-        ]}},
+        "query": {"bool": {"filter": flt, "must_not": must_not}},
     }
 
 
 def comp_probe(cfg, dev, since):
     ts = cfg["comp_ts"]
-    field = cfg["comp_device"].strip()
-    if field:
-        match = {"bool": {"should": [
-            {"term": {field: {"value": dev, "case_insensitive": True}}},
-            {"match_phrase": {field: dev}},
-        ], "minimum_should_match": 1}}
+    fields = cfg["comp_device"].strip()
+    if fields:
+        match = dev_match(fields, dev)
     else:
         match = {"query_string": {"query": '"%s"' % dev.replace("\\", "\\\\").replace('"', '\\"'),
                                    "lenient": True, "default_operator": "AND"}}
@@ -529,7 +558,7 @@ def prev_activity_probe(cfg, dev, before, lookback):
         "size": 1, "track_total_hits": False, "_source": False,
         "sort": [{ts: {"order": "desc", "unmapped_type": "date"}}],
         "query": {"bool": {"filter": [
-            {"term": {cfg["device_term"] or cfg["device"]: {"value": dev}}},
+            dev_match(cfg["device"], dev),
             {"range": {ts: {"gte": iso(before - lookback), "lt": iso(before)}}},
         ]}},
     }

@@ -1,88 +1,78 @@
 # ==================================================================================================
-# Устройства, которые запустили приложение, но не отправили ни одного запроса в Trisigma.
-# Kibana -> Dev Tools -> Console. Вставляйте блоки по одному и запускайте (Ctrl+Enter).
-# Время везде UTC (МСК = UTC+3). Названия полей ниже - предположение; если ES|QL пишет
-# "Unknown column [...]" - подберите настоящие имена шагами 1-2 и замените их в запросах.
+# Устройства, которые запустили приложение (версия > 11.10.0), но не отправили ни одного запроса в Trisigma.
+# Kibana -> Dev Tools -> Console. Вставляйте блоки по одному и запускайте (Ctrl+Enter). Время везде UTC (МСК = UTC+3).
+# Названия полей соответствуют реальным логам mpback-k8s-ingress (log.http_user_agent с id устройства внутри JSON,
+# log.request_url, log.status, log.http_x_burgerking_version/platform/user_id, log.request_hostname).
 # ==================================================================================================
 
 
-# ---- 0. Версия кластера. ES|QL (шаги 3-5) работает с Elasticsearch 8.14+ ------------------------
+# ---- 0. Версия кластера. ES|QL (шаги 2-3) работает с Elasticsearch 8.14+ ------------------------
 GET /
 
 
-# ---- 1. Как выглядят логи Ingress: последний запрос к trisigma и последний вообще ---------------
-GET mpback-k8s-ingress*/_search
+# ---- 1. Примеры документов: запрос к trisigma в Ingress и в Composition -------------------------
+GET mpback-k8s-ingress-*/_search
 {
-  "size": 1,
+  "size": 2,
   "sort": [{"@timestamp": {"order": "desc"}}],
+  "_source": {"excludes": ["*uthorization*", "*ookie*", "*jwt*", "*token*"]},
   "query": {"bool": {"filter": [
-    {"range": {"@timestamp": {"gte": "now-3d"}}},
-    {"query_string": {"query": "*trisigma*", "lenient": true, "analyze_wildcard": true}}
+    {"range": {"@timestamp": {"gte": "now-1d"}}},
+    {"match_phrase": {"log.request_hostname": "orderapp.burgerkingrus.ru"}},
+    {"match_phrase": {"log.request_url": "trisigma"}}
   ]}}
 }
 
-GET mpback-k8s-ingress*/_search
+GET mpback-k8s-trisigma-composition-*/_search
 {
   "size": 1,
   "sort": [{"@timestamp": {"order": "desc"}}],
-  "query": {"range": {"@timestamp": {"gte": "now-3d"}}}
-}
-
-
-# ---- 2. Имена полей: устройство / пользователь / платформа / версия / путь / статус / сессия ----
-GET mpback-k8s-ingress*/_field_caps?fields=*device*,*visitor*,*user*,*session*&ignore_unavailable=true
-
-GET mpback-k8s-ingress*/_field_caps?fields=*platform*,*version*,*path*,*uri*,*url*,*status*&ignore_unavailable=true
-
-# и индекс trisigma-composition: последний документ (где лежит visitorId)
-GET mpback-k8s-trisigma-composition*/_search
-{
-  "size": 1,
-  "sort": [{"@timestamp": {"order": "desc"}}]
+  "_source": {"excludes": ["*uthorization*", "*ookie*", "*jwt*", "*token*"]},
+  "query": {"range": {"@timestamp": {"gte": "now-1d"}}}
 }
 
 
 
-# ---- 3. Проверка фильтров (окно 1-2 часа). Должны быть: сервисы (не только пустой), пути trisigma,
-#         версии приложения. Если путей trisigma нет - основной запрос выдаст ВСЕХ, не запускайте его.
-# 3a. сервисы, разобранные из path
+# ---- 2. Проверка фильтров на коротком окне. Должны найтись сервисы, пути trisigma, версии. ------
+#         Если путей trisigma нет - основной запрос выдаст ВСЕХ, не запускайте его.
+# 2a. сервисы, разобранные из log.request_url
 POST /_query?format=txt
 {
   "query": """
-    FROM mpback-k8s-ingress*
-    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z"
-    | WHERE TO_LOWER(platform) IN ("ios", "android")
-    | DISSECT path "/gateway/%{svc}/%{?rest}"
-    | RENAME device_id AS dev
+    FROM mpback-k8s-ingress-*
+    | WHERE @timestamp >= "2026-09-28T00:00:00Z" AND @timestamp < "2026-09-29T00:30:00Z" AND log.request_hostname == "orderapp.burgerkingrus.ru"
+    | WHERE TO_LOWER(log.http_x_burgerking_platform) IN ("ios", "android")
+    | DISSECT log.request_url "/gateway/%{svc}/%{?rest}"
+    | GROK log.http_user_agent "\"id\"%{SPACE}:%{SPACE}\"%{DATA:dev}\""
     | STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev) BY svc
     | SORT docs DESC
     | LIMIT 30
   """
 }
 
-# 3b. запросы к trisigma в Ingress (реальные пути и сколько устройств)
+# 2b. запросы к trisigma в Ingress: пути, HTTP-статусы, сколько устройств (401 = приложение отправило, бэкенд отклонил)
 POST /_query?format=txt
 {
   "query": """
-    FROM mpback-k8s-ingress*
-    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z"
-    | WHERE TO_LOWER(path) LIKE "*trisigma*"
-    | RENAME device_id AS dev
-    | STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev), first_ts = MIN(@timestamp), last_ts = MAX(@timestamp) BY path
+    FROM mpback-k8s-ingress-*
+    | WHERE @timestamp >= "2026-09-28T00:00:00Z" AND @timestamp < "2026-09-29T00:30:00Z" AND log.request_hostname == "orderapp.burgerkingrus.ru"
+    | WHERE TO_LOWER(log.request_url) LIKE "*trisigma*"
+    | GROK log.http_user_agent "\"id\"%{SPACE}:%{SPACE}\"%{DATA:dev}\""
+    | STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev), first_ts = MIN(@timestamp), last_ts = MAX(@timestamp) BY log.request_url, log.status
     | SORT docs DESC
     | LIMIT 15
   """
 }
 
-# 3c. версии приложения (порог основного запроса: строго больше 11.10.0)
+# 2c. версии приложения (порог основного запроса: строго больше 11.10.0)
 POST /_query?format=txt
 {
   "query": """
-    FROM mpback-k8s-ingress*
-    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z"
-    | WHERE TO_LOWER(platform) IN ("ios", "android")
-    | GROK app_version "^%{INT:v_major:int}[.]%{INT:v_minor:int}[.]%{INT:v_patch:int}"
-    | RENAME device_id AS dev
+    FROM mpback-k8s-ingress-*
+    | WHERE @timestamp >= "2026-09-28T00:00:00Z" AND @timestamp < "2026-09-29T00:30:00Z" AND log.request_hostname == "orderapp.burgerkingrus.ru"
+    | WHERE TO_LOWER(log.http_x_burgerking_platform) IN ("ios", "android")
+    | GROK log.http_x_burgerking_version "^%{INT:v_major:int}[.]%{INT:v_minor:int}[.]%{INT:v_patch:int}"
+    | GROK log.http_user_agent "\"id\"%{SPACE}:%{SPACE}\"%{DATA:dev}\""
     | STATS docs = COUNT(*), devices = COUNT_DISTINCT(dev) BY v_major, v_minor, v_patch
     | SORT v_major DESC, v_minor DESC, v_patch DESC
     | LIMIT 30
@@ -91,26 +81,28 @@ POST /_query?format=txt
 
 
 
-# ---- 4. ОСНОВНОЙ ЗАПРОС: кандидаты --------------------------------------------------------------
-# Запуск = устройство обратилось не менее чем в 7 разных сервисов за одну минуту (веер запросов при старте).
+# ---- 3. ОСНОВНОЙ ЗАПРОС: кандидаты --------------------------------------------------------------
+# Запуск = устройство обратилось не менее чем в 6 разных сервисов за одну минуту (веер запросов при старте).
 # Кандидат = запуск в [from, to), а запросов к trisigma после него нет ни в этом окне, ни в 30 минутах после.
-# Порог версии: строго больше 11.10.0 (для «11.10.0 и выше» замените `> 11010000` на `>= 11010000`).
-# Окно начните с нескольких часов: запрос группирует по устройству и минуте, на суточном окне ему нужно много памяти.
-# Результат - предварительный: следующим шагом проверьте кандидатов на запросы ПОЗЖЕ и в индексе composition.
+# Запрос к trisigma с любым HTTP-статусом (в т.ч. 401) считается запросом (только 2xx/3xx: README, tri_ok_only).
+# Порог версии: строго больше 11.10.0 (для «11.10.0 и выше» замените `> 11010000` на `>= 11010000` в двух местах).
+# Результат предварительный: следующим шагом проверьте кандидатов на запросы ПОЗЖЕ и в индексе composition.
 POST /_query?format=txt
 {
   "query": """
-    FROM mpback-k8s-ingress*
-    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z" AND device_id IS NOT NULL
-    | GROK app_version "^%{INT:v_major:int}[.]%{INT:v_minor:int}[.]%{INT:v_patch:int}"
-    | EVAL is_tri = TO_LOWER(path) LIKE "*trisigma*", ver_num = v_major * 1000000 + v_minor * 1000 + v_patch
-    | EVAL ok = NOT is_tri AND TO_LOWER(platform) IN ("ios", "android") AND ver_num > 11010000
-    | DISSECT path "/gateway/%{svc}/%{?rest}"
-    | EVAL svc_ok = CASE(ok, svc), ver_ok = CASE(ok, ver_num), plat_ok = CASE(ok, CASE(TO_LOWER(platform) == "ios", 4, 5)), tri_flag = CASE(is_tri, 1, 0)
+    FROM mpback-k8s-ingress-*
+    | WHERE @timestamp >= "2026-09-28T00:00:00Z" AND @timestamp < "2026-09-29T00:30:00Z" AND log.request_hostname == "orderapp.burgerkingrus.ru"
+    | GROK log.http_x_burgerking_version "^%{INT:v_major:int}[.]%{INT:v_minor:int}[.]%{INT:v_patch:int}"
+    | EVAL ver_num = v_major * 1000000 + v_minor * 1000 + v_patch, is_tri_path = TO_LOWER(log.request_url) LIKE "*trisigma*"
+    | WHERE ver_num > 11010000 OR is_tri_path
+    | GROK log.http_user_agent "\"id\"%{SPACE}:%{SPACE}\"%{DATA:dev}\""
+    | WHERE dev IS NOT NULL
+    | EVAL is_tri = is_tri_path, ok = NOT is_tri_path AND TO_LOWER(log.http_x_burgerking_platform) IN ("ios", "android") AND ver_num > 11010000, uid_n = TO_LONG(log.http_x_burgerking_user_id)
+    | DISSECT log.request_url "/gateway/%{svc}/%{?rest}"
+    | EVAL svc_ok = CASE(ok, svc), ver_ok = CASE(ok, ver_num), plat_ok = CASE(ok, CASE(TO_LOWER(log.http_x_burgerking_platform) == "ios", 4, 5)), tri_flag = CASE(is_tri, 1, 0)
     | EVAL minute = DATE_TRUNC(1 minute, @timestamp)
-    | RENAME device_id AS dev
-    | STATS svc_cnt = COUNT_DISTINCT(svc_ok), tri_cnt = SUM(tri_flag), ver_num = MAX(ver_ok), plat = MAX(plat_ok), last_seen = MAX(@timestamp), uid = MAX(user_id) BY dev, minute
-    | EVAL is_launch = svc_cnt >= 7 AND minute < "2026-09-29T06:00:00Z"
+    | STATS svc_cnt = COUNT_DISTINCT(svc_ok), tri_cnt = SUM(tri_flag), ver_num = MAX(ver_ok), plat = MAX(plat_ok), last_seen = MAX(@timestamp), uid = MAX(uid_n) BY dev, minute
+    | EVAL is_launch = svc_cnt >= 6 AND minute < "2026-09-29T00:00:00Z"
     | EVAL launch_flag = CASE(is_launch, 1, 0), launch_min = CASE(is_launch, minute), fan = CASE(is_launch, svc_cnt), tri_min = CASE(tri_cnt > 0, minute)
     | STATS launches = SUM(launch_flag), first_launch = MIN(launch_min), max_fanout = MAX(fan), tri_total = SUM(tri_cnt), last_tri = MAX(tri_min), ver_num = MAX(ver_num), plat = MAX(plat), last_seen = MAX(last_seen), uid = MAX(uid) BY dev
     | WHERE launches > 0 AND (tri_total == 0 OR last_tri < first_launch - 2 minutes)
@@ -123,45 +115,51 @@ POST /_query?format=txt
 
 
 
-# ---- 5. Проверка кандидатов: у кого из них запрос в trisigma всё-таки был (это «ошибочные») -----
-# Подставьте device_id из шага 4 (до нескольких сотен за раз) и время начала окна.
-# 5a. Ingress: запросы к trisigma БЕЗ верхней границы по времени. Кто вернулся в ответе - тот не наш.
-POST mpback-k8s-ingress*/_search
+# ---- 4. Проверка кандидатов: у кого из них запрос в trisigma всё-таки был (это «ошибочные») -----
+# Подставьте id устройств (колонка dev из шага 3, до нескольких десятков за раз) и время начала окна.
+# 4a. Ingress: запросы к trisigma БЕЗ верхней границы по времени. Есть строки в ответе - устройство не наше.
+POST mpback-k8s-ingress-*/_search
 {
-  "size": 0,
+  "size": 100,
+  "sort": [{"@timestamp": {"order": "asc"}}],
+  "_source": ["@timestamp", "log.request_url", "log.status", "log.http_user_agent"],
   "query": {"bool": {"filter": [
-    {"terms": {"device_id": ["<device_id_1>", "<device_id_2>"]}},
-    {"range": {"@timestamp": {"gte": "2026-09-29T00:00:00Z"}}},
-    {"wildcard": {"path": {"value": "*trisigma*", "case_insensitive": true}}}
-  ]}},
-  "aggs": {"by_device": {
-    "terms": {"field": "device_id", "size": 1000},
-    "aggs": {"first_request": {"min": {"field": "@timestamp"}}}
-  }}
+    {"bool": {"should": [
+      {"match_phrase": {"log.http_user_agent": "<device_id_1>"}},
+      {"match_phrase": {"log.http_user_agent": "<device_id_2>"}}
+    ], "minimum_should_match": 1}},
+    {"range": {"@timestamp": {"gte": "2026-09-28T00:00:00Z"}}},
+    {"wildcard": {"log.request_url": {"value": "*trisigma*", "case_insensitive": true}}}
+  ]}}
 }
 
-# 5b. trisigma-composition: id устройства ищется фразой по всем полям (visitorId обычно внутри тела запроса).
-# Кто встретился в ответе (смотрите _source) - тот получил запрос в trisigma.
-# Если Elasticsearch ругается на число полей - добавьте в query_string "fields": ["message"] (или своё поле с телом запроса).
-POST mpback-k8s-trisigma-composition*/_search
+# 4b. trisigma-composition: id устройства в User-Agent входящего запроса и в теле запроса к Trisigma (visitorId).
+# Есть строки в ответе - устройство получило запрос в trisigma.
+POST mpback-k8s-trisigma-composition-*/_search
 {
-  "size": 200,
-  "_source": ["@timestamp", "message"],
+  "size": 100,
+  "sort": [{"@timestamp": {"order": "asc"}}],
+  "_source": ["@timestamp", "log.http_incoming_request.request_data.path", "log.http_incoming_request.request_data.user_agent"],
   "query": {"bool": {"filter": [
-    {"range": {"@timestamp": {"gte": "2026-09-29T00:00:00Z"}}},
-    {"query_string": {"query": "\"<device_id_1>\" OR \"<device_id_2>\"", "lenient": true}}
+    {"range": {"@timestamp": {"gte": "2026-09-28T00:00:00Z"}}},
+    {"bool": {"should": [
+      {"match_phrase": {"log.http_incoming_request.request_data.user_agent": "<device_id_1>"}},
+      {"match_phrase": {"log.outgoing_http_request.request_data.body": "<device_id_1>"}},
+      {"match_phrase": {"log.http_incoming_request.request_data.user_agent": "<device_id_2>"}},
+      {"match_phrase": {"log.outgoing_http_request.request_data.body": "<device_id_2>"}}
+    ], "minimum_should_match": 1}}
   ]}}
 }
 
 
-# ---- 6. (по желанию) Пересечение с событиями без эксперимента -----------------------------------
+# ---- 5. (по желанию) Пересечение с событиями без эксперимента -----------------------------------
 # Замените индекс, поле устройства и поле эксперимента на свои. «Не пришло или пустое» = нет поля / null / "".
-# В IN подставьте device_id кандидатов, прошедших шаг 5. Останутся те, у кого ни в одном событии эксперимента нет.
+# В IN подставьте id устройств кандидатов, прошедших шаг 4. Останутся те, у кого ни в одном событии эксперимента нет.
 POST /_query?format=txt
 {
   "query": """
     FROM <индекс-событий>*
-    | WHERE @timestamp >= "2026-09-29T00:00:00Z" AND @timestamp < "2026-09-29T06:30:00Z"
+    | WHERE @timestamp >= "2026-09-28T00:00:00Z" AND @timestamp < "2026-09-29T00:30:00Z"
     | WHERE device_id IN ("<device_id_1>", "<device_id_2>")
     | EVAL has_experiment = experiment IS NOT NULL AND experiment != ""
     | EVAL exp_flag = CASE(has_experiment, 1, 0)

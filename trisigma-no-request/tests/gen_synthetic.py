@@ -22,11 +22,11 @@ TRI_EXPERIMENTS = "/gateway/trisigma-composition/api/v7/trisigma/experiments"
 
 VER = {
     ("android", "new"): "11.10.1.g_20300",
-    ("android", "new2"): "11.11.0.r_20400",
+    ("android", "new2"): "11.11.0-rc-08.g_20269",
     ("android", "edge"): "11.10.0.g_20261",
     ("android", "old"): "11.9.0.g_20241",
     ("ios", "new"): "11.10.1_380",
-    ("ios", "new2"): "11.12.3_412",
+    ("ios", "new2"): "11.11.0_384",
     ("ios", "edge"): "11.10.0_372",
     ("ios", "old"): "11.9.0_347",
 }
@@ -42,19 +42,31 @@ def new_id(platform):
 
 
 TRI_AFTER_LAUNCH = {"normal", "late20", "very_late", "only_comp", "only_comp_unmapped", "failed_tri", "exp_only",
-                    "tri_no_platform"}          # scenarios where the device DID send a trisigma request after launching
+                    "tri_no_platform", "tri_401"}          # scenarios where the device DID send a trisigma request after launching
 ingress, comp, events = [], [], []
 expected = {}  # device_id -> dict(level1: bool, final: bool, note: str)
 
 
-def ing(t, dev, user, platform, ver, svc=None, path=None, status=200, method="GET", omit=()):
-    d = {
-        "@timestamp": iso(t), "device_id": dev, "user_id": user, "platform": platform, "app_version": ver,
-        "path": path or f"/gateway/{svc}/api/v7/{svc}/state", "status": status, "method": method,
-        "remote_addr": f"10.1.{rnd.randint(0, 255)}.{rnd.randint(0, 255)}",
-    }
-    for k in omit:
-        d.pop(k, None)
+HOST = "orderapp.burgerkingrus.ru"
+
+
+def ua_json(dev, platform):
+    """User-Agent как в реальных логах: id устройства внутри JSON (Android - длинная строка с пробелами)."""
+    if platform == "ios":
+        return '{"os_api":"18.0","model":"iPhone","os":"iOS","os_ver":"26.6.1","vendor":"apple","id":"%s"}' % dev
+    return ('{  "id":"%s",  "vendor":"Xiaomi",  "model":"25118PC98G",  "os":"android",  '
+            '"os_ver":"6.6.77-android15-8-g4a507830d890-ab13221457",  "os_api":"35"}') % dev
+
+
+def ing(t, dev, user, platform, ver, svc=None, path=None, status=200, method="GET", omit=(), host=HOST):
+    url = path or f"/gateway/{svc}-composition/api/v7/{svc}/state"
+    d = {"@timestamp": iso(t), "log": {
+        "request_hostname": host, "request_method": method, "request_url": url, "url": "/root_rewrite" + url,
+        "status": str(status), "http_user_agent": ua_json(dev, platform), "http_x_burgerking_version": ver,
+        "http_x_burgerking_platform": platform, "http_x_burgerking_user_id": str(user) if user else "",
+        "X-Trace-Id": "%032x" % rnd.getrandbits(128)}}
+    for k in omit:                                   # "platform" / "app_version" -> поля в log.*
+        d["log"].pop({"platform": "http_x_burgerking_platform", "app_version": "http_x_burgerking_version"}[k], None)
     ingress.append(d)
 
 
@@ -68,10 +80,12 @@ def burst(t, dev, user, platform, ver, n=8, split_at=None, skip=()):
 
 
 def comp_doc(t, dev, upper=False, mapped=True):
-    body = {"params": {"participant": {"visitorId": dev, "userId": 1}}}
-    d = {"@timestamp": iso(t), "message": "trisigma-composition request " + json.dumps(body)}
+    """Лог composition: id устройства в User-Agent входящего запроса (mapped) или только в теле запроса к Trisigma."""
+    body = '{"participant":{"userId":1,"visitorId":"%s"},"platform":{"id":5,"version":"11.11.0"}}' % dev.lower()
+    d = {"@timestamp": iso(t), "log": {"outgoing_http_request": {"request_data": {"body": body, "pattern": "/getFeaturesByTag/"}}}}
     if mapped:
-        d["visitor_id"] = dev.upper() if upper else dev.lower()
+        d["log"]["http_incoming_request"] = {"request_data": {"path": "/api/v7/trisigma/features",
+                                              "user_agent": ua_json(dev.upper() if upper else dev, "android")}}
     comp.append(d)
 
 
@@ -181,6 +195,16 @@ def web(t, dev, user, platform, ver):
     burst(t, dev, user, "web", "1.0", n=9)
 
 
+def other_host(t, dev, user, platform, ver):
+    for i, sv in enumerate(SERVICES[:8]):
+        ing(t + dt.timedelta(milliseconds=100 * i), dev, user, platform, ver, svc=sv, host="logist.burgerkingrus.ru")
+
+
+def tri_401(t, dev, user, platform, ver):
+    burst(t, dev, user, platform, ver)
+    tri(t + dt.timedelta(seconds=2), dev, user, platform, ver, status=401)
+
+
 def launch_after_window(t, dev, user, platform, ver):
     burst(T1 + dt.timedelta(minutes=45), dev, user, platform, ver)   # launch outside the analysed window
 
@@ -212,6 +236,9 @@ add("short_gap", "android", "new", 3, True, True, "gap 10 min before the burst",
 add("cold_gap", "ios", "new", 3, True, True, "gap 180 min before the burst", cold_gap)
 add("low_fanout", "android", "new", 5, False, False, "3 services: not a launch", low_fanout)
 add("split_burst", "android", "new", 3, False, False, "burst split across minute boundary: known limitation", split_burst)
+add("other_host", "android", "new", 3, False, False, "another host (not the mobile API)", other_host)
+add("tri_401", "android", "new", 3, False, False, "trisigma request answered 401: a request, unless tri_ok_only", tri_401)
+add("tri_401", "ios", "new2", 2, False, False, "trisigma request answered 401", tri_401)
 add("web", "android", "new", 4, False, False, "web traffic", web)
 add("late_launch", "ios", "new", 3, False, False, "launch after window end", launch_after_window)
 
@@ -221,21 +248,17 @@ for _ in range(200):
     dev = new_id(p)
     ing(T0 + dt.timedelta(minutes=rnd.randint(0, 400)), dev, rnd.randint(1, 10**7), p, VER[(p, "new")], svc=rnd.choice(SERVICES))
 
-MAPPINGS = {
-    "mpback-k8s-ingress-2026.09.29": {"properties": {
-        "@timestamp": {"type": "date"}, "device_id": {"type": "keyword"}, "user_id": {"type": "long"},
-        "platform": {"type": "keyword"}, "app_version": {"type": "keyword"}, "path": {"type": "keyword"},
-        "status": {"type": "integer"}, "method": {"type": "keyword"}, "remote_addr": {"type": "ip"}}},
-    "mpback-k8s-trisigma-composition-2026.09.29": {"properties": {
-        "@timestamp": {"type": "date"}, "message": {"type": "text"}, "visitor_id": {"type": "keyword"}}},
-    "mpback-k8s-events-2026.09.29": {"properties": {
+MAPPINGS = {   # Ingress и composition - динамический маппинг, как в реальном кластере (строки = text + .keyword)
+    "mpback-k8s-ingress-20260929": {"properties": {"@timestamp": {"type": "date"}}},
+    "mpback-k8s-trisigma-composition-20260929": {"properties": {"@timestamp": {"type": "date"}}},
+    "mpback-k8s-events-20260929": {"properties": {
         "@timestamp": {"type": "date"}, "device_id": {"type": "keyword"}, "user_id": {"type": "long"},
         "event": {"type": "keyword"}, "experiment": {"type": "keyword"}}},
 }
 DATA = {
-    "mpback-k8s-ingress-2026.09.29": ingress,
-    "mpback-k8s-trisigma-composition-2026.09.29": comp,
-    "mpback-k8s-events-2026.09.29": events,
+    "mpback-k8s-ingress-20260929": ingress,
+    "mpback-k8s-trisigma-composition-20260929": comp,
+    "mpback-k8s-events-20260929": events,
 }
 
 
